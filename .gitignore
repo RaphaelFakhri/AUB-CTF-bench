@@ -1,1 +1,12 @@
+
 .secrets
+.env
+__pycache__/
+*.pyc
+.venv
+venv/
+env/
+kali-linux-image/kali-linux-full.tar
+kali-linux-image/.tmp-kali-linux-full.tar140253714
+README.md
+kali-linux-image/test-tools.sh

@@ -1,0 +1,362 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  docker-build:
+    runs-on: self-hosted
+    timeout-minutes: 900 # 15 hours timeout for large Kali images with registry cache
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check cache registry availability and health
+        run: |
+          echo "=== Checking cache registry availability and health ==="
+
+          # Check for registry to be healthy
+          if ! curl -f http://localhost:5000/v2/ >/dev/null 2>&1; then
+            echo "❌ Cache registry not available at localhost:5000"
+            echo "Please, setup new local registry"
+            exit 1
+          fi
+
+          # Check cache namespace
+          if curl -s http://localhost:5000/v2/kali-cache/tags/list >/dev/null 2>&1; then
+            echo "✅ Cache namespace accessible"
+          else
+            echo "⚠️ Cache namespace not accessible (first run?)"
+          fi
+
+          # Show existing cache
+          echo "=== Existing cache images ==="
+          curl -s http://localhost:5000/v2/kali-cache/tags/list | jq '.' || echo "No cache or jq not available"
+
+          # Test registry write capability
+          echo "🧪 Testing registry write capability..."
+          if curl -X POST http://localhost:5000/v2/test-namespace/blobs/uploads/ >/dev/null 2>&1; then
+            echo "✅ Registry accepts write operations"
+          else
+            echo "⚠️ Registry write test failed (might be OK for first run)"
+          fi
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: 'aub-ctf-bench'
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+          echo "sha_short=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "version=$TAG" >> $GITHUB_OUTPUT
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          else
+            TAG="latest"
+            echo "version=$TAG" >> $GITHUB_OUTPUT
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+          fi
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Setup ephemeral BuildKit builder with registry cache
+        run: |
+          BUILDER_NAME="kali-builder-ci"
+          CACHE_REGISTRY="kali-cache-registry:5000"
+
+          echo "=== Setting up ephemeral builder for CI ==="
+
+          # Check if builder exists and its state
+          if docker buildx ls | grep -q "$BUILDER_NAME"; then
+            echo "Found existing builder: $BUILDER_NAME"
+
+            # Check if builder is healthy
+            if docker buildx inspect "$BUILDER_NAME" --bootstrap >/dev/null 2>&1; then
+              echo "✅ Existing builder is healthy, using it"
+            else
+              echo "❌ Existing builder is unhealthy, removing..."
+              docker buildx rm "$BUILDER_NAME" || true
+              echo "Creating new builder..."
+              docker buildx create \
+                --name "$BUILDER_NAME" \
+                --driver docker-container \
+                --driver-opt image=moby/buildkit:buildx-stable-1 \
+                --driver-opt network=kali-build-network \
+                --driver-opt env.BUILDKIT_MAX_PARALLELISM=1 \
+                --driver-opt env.BUILDKIT_STEP_LOG_MAX_SIZE=209715200 \
+                --driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=52428800 \
+                --driver-opt env.SYFT_LOG_LEVEL=warn \
+                --driver-opt env.SYFT_FAIL_ON_ERROR=false \
+                --driver-opt env.GOMEMLIMIT=5GiB \
+                --driver-opt env.GOGC=100 \
+                --config ./buildkitd.toml \
+                --use \
+                --bootstrap
+            fi
+          else
+            echo "No existing builder found, creating new one..."
+            docker buildx create \
+              --name "$BUILDER_NAME" \
+              --driver docker-container \
+              --driver-opt image=moby/buildkit:buildx-stable-1 \
+              --driver-opt network=kali-build-network \
+              --driver-opt env.BUILDKIT_MAX_PARALLELISM=1 \
+              --driver-opt env.BUILDKIT_STEP_LOG_MAX_SIZE=209715200 \
+              --driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=52428800 \
+              --driver-opt env.SYFT_LOG_LEVEL=warn \
+              --driver-opt env.SYFT_FAIL_ON_ERROR=false \
+              --driver-opt env.GOMEMLIMIT=5GiB \
+              --driver-opt env.GOGC=100 \
+              --config ./buildkitd.toml \
+              --use \
+              --bootstrap
+          fi
+
+          echo "✅ Builder $BUILDER_NAME ready and connected to registry network"
+
+          # Export builder name for subsequent steps
+          echo "BUILDER_NAME=$BUILDER_NAME" >> $GITHUB_ENV
+          echo "CACHE_REGISTRY=$CACHE_REGISTRY" >> $GITHUB_ENV
+
+      - name: Pre-build cache analysis
+        run: |
+          echo "=== Build Cache Analysis (Before Build) ==="
+          echo "BuildKit cache status:"
+          docker buildx du --builder $BUILDER_NAME | tail -10 || echo "Cache empty"
+
+          echo "Registry cache status:"
+          curl -s http://localhost:5000/v2/kali-cache/tags/list | jq '.' || echo "No cache images yet"
+
+          echo "Checking for existing cache images..."
+          curl -sf http://localhost:5000/v2/kali-cache/manifests/base-latest >/dev/null && echo "✅ Found base cache" || echo "❌ No base cache"
+          curl -sf http://localhost:5000/v2/kali-cache/manifests/systemd-latest >/dev/null && echo "✅ Found systemd cache" || echo "❌ No systemd cache"
+
+      - name: Build with registry cache (optimized sequential)
+        run: |
+          echo "=== Building with registry cache ==="
+          echo "Tag: $TAG"
+          echo "Registry: aub-ctf-bench"
+          echo "Cache Registry: $CACHE_REGISTRY (via Docker network)"
+          echo "Builder: $BUILDER_NAME with registry cache"
+
+          # Step 1: Build base images first with registry cache
+          echo "🔨 Building base images with registry cache..."
+          docker buildx bake \
+            --builder $BUILDER_NAME \
+            --progress=plain \
+            --push \
+            --set="base.cache-from=type=registry,ref=$CACHE_REGISTRY/kali-cache:base-latest,registry.insecure=true" \
+            --set="base.cache-to=type=registry,ref=$CACHE_REGISTRY/kali-cache:base-latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true" \
+            sequential
+
+          echo "📊 Cache status after base build:"
+          curl -s http://localhost:5000/v2/kali-cache/tags/list | jq '.' || echo "API error"
+
+          # Step 2: Build systemd images (will reuse base layers from registry cache)
+          echo "🔨 Building systemd images with registry cache..."
+          docker buildx bake \
+            --builder $BUILDER_NAME \
+            --progress=plain \
+            --push \
+            --set="systemd.cache-from=type=registry,ref=$CACHE_REGISTRY/kali-cache:base-latest,registry.insecure=true" \
+            --set="systemd.cache-from=type=registry,ref=$CACHE_REGISTRY/kali-cache:systemd-latest,registry.insecure=true" \
+            --set="systemd.cache-to=type=registry,ref=$CACHE_REGISTRY/kali-cache:systemd-latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true" \
+            dependent
+        env:
+          DOCKER_BUILDKIT: 1
+          TAG: ${{ steps.meta.outputs.version }}
+
+      - name: Export image for security scanning
+        run: |
+          echo "=== Exporting built image for security scan ==="
+          echo "Exporting aub-ctf-bench/kali-linux:$TAG for local security scanning..."
+
+          # Export only latest base image for current architecture to local Docker
+          docker buildx build \
+            --builder $BUILDER_NAME \
+            --platform linux/$(dpkg --print-architecture) \
+            --cache-from type=registry,ref=$CACHE_REGISTRY/kali-cache:base-latest,registry.insecure=true \
+            --target base \
+            --tag aub-ctf-bench/kali-linux:scan-target \
+            --load \
+            .
+
+          echo "✅ Image exported locally as aub-ctf-bench/kali-linux:scan-target"
+          docker images | grep "aub-ctf-bench/kali-linux" || echo "No images found"
+
+      - name: Post-build cache analysis
+        run: |
+          echo "=== Build Cache Analysis (After Build) ==="
+          echo "BuildKit local cache:"
+          docker buildx du --builder $BUILDER_NAME --verbose | head -20
+
+          echo "Registry cache images:"
+          curl -s http://localhost:5000/v2/kali-cache/tags/list | jq '.'
+
+          echo "Cache sizes:"
+          for tag in base-latest systemd-latest; do
+            if curl -sf http://localhost:5000/v2/kali-cache/manifests/$tag >/dev/null; then
+              size=$(curl -sf http://localhost:5000/v2/kali-cache/manifests/$tag | jq -r '.config.size // "unknown"')
+              echo "  kali-cache:$tag -> ${size} bytes"
+            fi
+          done
+
+      - name: Cleanup ephemeral builder
+        if: success()
+        run: |
+          echo "=== Cleaning up ephemeral builder after successful build ==="
+          if [[ -n "${BUILDER_NAME:-}" ]]; then
+            echo "Removing builder: $BUILDER_NAME"
+            docker buildx rm "$BUILDER_NAME" || echo "Builder already removed"
+            echo "✅ Ephemeral builder cleaned up"
+          else
+            echo "No builder to clean up"
+          fi
+
+      - name: Preserve builder for debugging
+        if: failure()
+        run: |
+          echo "=== Build failed - preserving builder for debugging ==="
+          if [[ -n "${BUILDER_NAME:-}" ]]; then
+            echo "🔍 Builder '$BUILDER_NAME' is preserved for debugging"
+            echo "To inspect: docker buildx inspect $BUILDER_NAME"
+            echo "To debug: docker buildx build --builder $BUILDER_NAME --progress=debug ..."
+            echo "To cleanup later: docker buildx rm $BUILDER_NAME"
+          else
+            echo "No builder to preserve"
+          fi
+
+      - name: Generate build summary
+        run: |
+          echo "## 🐳 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | Status | Platforms | Features |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|-----------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| aub-ctf-bench/kali-linux:${{ steps.meta.outputs.version }} | ✅ Built & Pushed | linux/amd64, linux/arm64 | 🔒 SBOM, 🛡️ Provenance |" >> $GITHUB_STEP_SUMMARY
+          echo "| aub-ctf-bench/kali-linux:systemd | ✅ Built & Pushed | linux/amd64, linux/arm64 | 🔒 SBOM, 🛡️ Provenance, ⚙️ Systemd |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**📋 Build Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** \`${{ steps.meta.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ steps.meta.outputs.sha_short }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Date:** \`${{ steps.meta.outputs.date }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by:** \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**🛡️ Security Features:**" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Software Bill of Materials (SBOM) generated" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Build provenance attestation created" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Multi-platform support (AMD64 + ARM64)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**🔄 Cache Management:**" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Registry cache enabled (ephemeral builder)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Multi-stage cache optimization" >> $GITHUB_STEP_SUMMARY
+
+  security-scan:
+    needs: docker-build
+    runs-on: self-hosted
+
+    steps:
+      - name: Verify locally built image availability
+        run: |
+          echo "Checking for locally built image..."
+          if docker images | grep -q "aub-ctf-bench/kali-linux.*scan-target"; then
+            echo "✅ Local image found for scanning"
+            docker images | grep "aub-ctf-bench/kali-linux"
+          else
+            echo "❌ Local image not found, this should not happen"
+            exit 1
+          fi
+
+      - name: Run Trivy vulnerability scanner on local image
+        run: |
+          echo "Running Trivy scan on locally built image..."
+
+          # Scan the local image that was exported from build job
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):$(pwd)" \
+            -w "$(pwd)" \
+            --memory=4g \
+            --memory-swap=8g \
+            -e TRIVY_PARALLEL=4 \
+            aquasec/trivy:0.63.0 \
+            image \
+            --format sarif \
+            --output trivy-results.sarif \
+            --scanners vuln \
+            --timeout 60m \
+            --severity CRITICAL,HIGH \
+            --skip-files '**/*.dll,**/*.exe,**/libstdc++-6.dll' \
+            --skip-dirs '/usr/lib/gcc,/usr/share/doc' \
+            --quiet \
+            aub-ctf-bench/kali-linux:scan-target
+
+          echo "✅ Trivy scan completed on local image"
+        continue-on-error: true
+
+      - name: Verify SARIF file exists
+        id: check_sarif
+        run: |
+          if [ -f "trivy-results.sarif" ]; then
+            echo "SARIF file found, size: $(du -h trivy-results.sarif)"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "SARIF file not found, skipping upload"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && steps.check_sarif.outputs.exists == 'true'
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Generate security summary
+        if: always()
+        run: |
+          echo "## 🛡️ Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check if SARIF file exists and get vulnerability count
+          if [ -f "trivy-results.sarif" ]; then
+            if command -v jq >/dev/null 2>&1; then
+              VULN_COUNT=$(jq '.runs[0].results | length' trivy-results.sarif 2>/dev/null || echo "unknown")
+              if [ "$VULN_COUNT" = "unknown" ] || [ "$VULN_COUNT" = "null" ]; then
+                echo "- ✅ **Trivy scan completed** but vulnerability count could not be determined" >> $GITHUB_STEP_SUMMARY
+              elif [ "$VULN_COUNT" -eq 0 ]; then
+                echo "- ✅ **No critical/high vulnerabilities found** by Trivy scan" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "- ⚠️ **$VULN_COUNT critical/high vulnerabilities** found by Trivy scan" >> $GITHUB_STEP_SUMMARY
+              fi
+            else
+              echo "- ✅ **Trivy scan completed** and results file generated" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            # Check if SARIF was uploaded
+            if [ "${{ steps.check_sarif.outputs.exists }}" = "true" ]; then
+              echo "- ✅ **Results uploaded** to GitHub Security tab" >> $GITHUB_STEP_SUMMARY
+              echo "- 📊 **View details:** Go to Security → Code scanning alerts" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ❌ **Results upload failed** - check logs for details" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "- ❌ **Trivy scan failed** - SARIF results file not generated" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔍 **Check logs** above for timeout or scanning errors" >> $GITHUB_STEP_SUMMARY
+            echo "- 💡 **Tip:** Large images may require scanning optimization" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Cleanup local resources
+        if: always()
+        run: |
+          echo "Cleaning up local resources..."
+          docker rmi aub-ctf-bench/kali-linux:scan-target 2>/dev/null || echo "Scan target image not found"
+          echo "✅ Cleanup completed"
